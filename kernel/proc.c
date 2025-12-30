@@ -110,6 +110,29 @@ static struct proc*
 allocproc(void)
 {
   struct proc *p;
+  
+  if((p->usyscall = (struct usyscall *)kalloc()) == 0){
+    freeproc(p);
+release(&p->lock);
+return 0;
+}
+p->usyscall->pid = p->pid;  // 初始化pid
+
+// pagetable_t proc_pagetable(struct proc *p)函数
+// 映射USYSCALL页面
+if(mappages(pagetable, USYSCALL, PGSIZE,
+            (uint64)(p->usyscall), PTE_R | PTE_U) < 0){
+uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+uvmunmap(pagetable, TRAPFRAME, 1, 0);
+uvmfree(pagetable, 0);
+return 0;
+}
+// static void freeproc(struct proc *p)函数
+if(p->usyscall)
+    kfree((void*)p->usyscall);
+p->usyscall = 0;
+// void proc_freepagetable(pagetable_t pagetable, uint64 sz)函数
+uvmunmap(pagetable, USYSCALL, 1, 0);
 
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);

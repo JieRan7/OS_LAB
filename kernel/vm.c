@@ -195,26 +195,30 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 {
   uint64 a;
   pte_t *pte;
-  int sz;
-
-  if((va % PGSIZE) != 0)
-    panic("uvmunmap: not aligned");
-
-  for(a = va; a < va + npages*PGSIZE; a += sz){
-    sz = PGSIZE;
+  for(a = va; a < va + npages * PGSIZE; a += PGSIZE){
     if((pte = walk(pagetable, a, 0)) == 0)
-      panic("uvmunmap: walk");
-    if((*pte & PTE_V) == 0) {
-      printf("va=%ld pte=%ld\n", a, *pte);
-      panic("uvmunmap: not mapped");
-    }
+      continue;
+    if((*pte & PTE_V) == 0)
+      continue;
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
-    if(do_free){
-      uint64 pa = PTE2PA(*pte);
-      kfree((void*)pa);
+    uint64 pa = PTE2PA(*pte);
+    // 检查是否是超级页
+    if(is_superpage_pte(*pte)){
+      // 超级页处理：跳过整个 2MB 区域
+      if(do_free){
+        superfree((void*)pa);
+      }
+      // 清除 PTE
+      *pte = 0;
+      a += 2*1024*1024 - PGSIZE; // 跳过剩余的超级页区域
+      continue;
+    } else {
+      if(do_free){
+        kfree((void*)pa);
+      }
+      *pte = 0;
     }
-    *pte = 0;
   }
 }
 
@@ -255,23 +259,25 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
 {
   char *mem;
   uint64 a;
-  int sz;
-
   if(newsz < oldsz)
-    return oldsz;
-
-  oldsz = PGROUNDUP(oldsz);
-  for(a = oldsz; a < newsz; a += sz){
-    sz = PGSIZE;
+return oldsz;
+  if(newsz - oldsz >= 2*1024*1024 && 
+     (oldsz % (2*1024*1024)) == 0) {
+    uint64 super_size = (newsz - oldsz) & ~(2*1024*1024 - 1);
+    if(super_size > 0){
+      if(uvmsuperalloc(pagetable, oldsz, oldsz + super_size, xperm)){
+        oldsz += super_size;
+      }
+    }
+  }
+  for(a = oldsz; a < newsz; a += PGSIZE){
     mem = kalloc();
     if(mem == 0){
       uvmdealloc(pagetable, a, oldsz);
       return 0;
     }
-#ifndef LAB_SYSCALL
-    memset(mem, 0, sz);
-#endif
-    if(mappages(pagetable, a, sz, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
+    memset(mem, 0, PGSIZE);
+    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_R|PTE_U|xperm) != 0){
       kfree(mem);
       uvmdealloc(pagetable, a, oldsz);
       return 0;
@@ -340,31 +346,45 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
-  int szinc;
-
-  for(i = 0; i < sz; i += szinc){
-    szinc = PGSIZE;
-    szinc = PGSIZE;
+  for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+    // 检查是否是超级页
+    if(is_superpage_pte(*pte)){
+      // 分配新的超级页
+      char *mem = superalloc();
+      if(mem == 0){
+        uvmunmap(new, 0, i / PGSIZE, 1);
+        return -1;
+      }
+      memmove(mem, (char*)pa, 2*1024*1024);
+      pte_t *new_pte = walk(new, i, 1);
+      if(new_pte == 0){
+        superfree(mem);
+        uvmunmap(new, 0, i / PGSIZE, 1);
+        return -1;
+      }
+      *new_pte = PA2PTE((uint64)mem) | flags;
+      i += 2*1024*1024 - PGSIZE; 
+    } else {
+      char *mem = kalloc();
+      if(mem == 0){
+        uvmunmap(new, 0, i / PGSIZE, 1);
+        return -1;
+      }
+      memmove(mem, (char*)pa, PGSIZE);
+      if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+        kfree(mem);
+        uvmunmap(new, 0, i / PGSIZE, 1);
+        return -1;
+      }
     }
   }
   return 0;
-
- err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
-  return -1;
 }
 
 // mark a PTE invalid for user access.
@@ -486,11 +506,74 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   }
 }
 
+// 辅助函数
+void 
+_vmprint(pagetable_t pagetable, int level) 
+{
+  for(int i = 0; i < 512; i++){
+    pte_t pte = pagetable[i];
+    if(pte & PTE_V){
+      for(int j = 0; j < level; j++){
+        if(j) printf(" ");
+        printf("..");
+      }
+      uint64 child = PTE2PA(pte);
+      printf("%d: pte %p pa %p\n", i, (void*)pte, (void*)child); // 注意类型转换
+      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
+        _vmprint((pagetable_t)child, level + 1);
+      }
+    }
+  }
+}
+
+int is_superpage_aligned(uint64 va) {
+  return (va % (2*1024*1024)) == 0;
+}
+int is_superpage_pte(pte_t pte) {
+  return (pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) && (pte & PTE_S);
+}
+#define PTE_S (1L << 10) // 设置超级页 PTE 标志位
+int
+uvmsuperalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+{
+  uint64 a, pa;
+  pte_t *pte;
+  if(newsz < oldsz)
+    return 0;
+  oldsz = PGROUNDUP(oldsz);
+  if(oldsz % (2*1024*1024) != 0){
+    oldsz = PGROUNDUP(oldsz + (2*1024*1024 - 1)) & ~(2*1024*1024 - 1);
+  }
+  for(a = oldsz; a < newsz; a += 2*1024*1024){
+    pa = (uint64)superalloc();
+    if(pa == 0){
+      uvmunmap(pagetable, oldsz, (a - oldsz) / PGSIZE, 1);
+      return 0;
+    }
+    pte = walk(pagetable, a, 0);
+    if(pte == 0){
+      superfree((void*)pa);
+      uvmunmap(pagetable, oldsz, (a - oldsz) / PGSIZE, 1);
+      return 0;
+    }
+    // 设置超级页 PTE
+    *pte = PA2PTE(pa) | PTE_V | PTE_U | PTE_S;
+    if(xperm & PTE_X)
+      *pte |= PTE_X;
+    if(xperm & PTE_W)
+      *pte |= PTE_W;
+    if(xperm & PTE_R)
+      *pte |= PTE_R;
+  }
+  return 1;
+}
 
 #ifdef LAB_PGTBL
 void
 vmprint(pagetable_t pagetable) {
   // your code here
+  printf("page table %p\n", (void*)pagetable); // 注意类型转换
+  _vmprint(pagetable, 1);
 }
 #endif
 

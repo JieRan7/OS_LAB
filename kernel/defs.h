@@ -236,4 +236,12 @@ int             e1000_transmit(char *, int);
 void            netinit(void);
 void            net_rx(char *buf, int len);
 
+
+// add lab3
+void*           superalloc(void);
+void            superfree(void*);
+int             uvmsuperalloc(pagetable_t, uint64, uint64, int);
+int             is_superpage_pte(pte_t);
+int             is_superpage_aligned(uint64);
+
 #endif

@@ -80,3 +80,56 @@ kalloc(void)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
 }
+
+void*
+superalloc(void)
+{
+  acquire(&kmem.lock);
+  struct run *r, *start = 0;
+  int count = 0;
+  uint64 start_pa = 0;
+  for(r = kmem.freelist; r; r = r->next){
+    if(count == 0){
+      start = r;
+      start_pa = (uint64)r;
+      count = 1;
+    } else if((uint64)r == (uint64)(start + count * 4096)){
+      count++;
+      if(count == 512){
+        break;
+      }
+    } else {
+      count = 0;
+    }
+  }
+  if(count < 512){
+    release(&kmem.lock);
+    return 0; // 没有足够的连续内存
+  }
+  struct run *prev = 0;
+  for(r = kmem.freelist; r && r != start; prev = r, r = r->next);
+  if(prev)
+    prev->next = start->next;
+  else
+    kmem.freelist = start->next;
+  release(&kmem.lock);
+  if(start_pa % (2*1024*1024) != 0){
+    panic("superalloc: not 2MB aligned");
+  }
+  memset((void*)start_pa, 0, 2*1024*1024);
+  
+  return (void*)start_pa;
+}
+void
+superfree(void *pa)
+{
+  if((uint64)pa % (2*1024*1024) != 0)
+    panic("superfree: not 2MB aligned");
+  acquire(&kmem.lock);
+  for(int i = 0; i < 512; i++){
+    struct run *r = (struct run*)((char*)pa + i * 4096);
+    r->next = kmem.freelist;
+    kmem.freelist = r;
+  }
+  release(&kmem.lock);
+}
