@@ -19,10 +19,24 @@ static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
 static struct spinlock netlock;
 
+// add
+
+int port_bindings[MAX_PORTS];
+static struct spinlock netlock;
+static struct spinlock portlock;
+struct udp_queue udp_queues[MAX_PORTS];   //UDP包队列，每个端口都有一个队列
+
 void
 netinit(void)
 {
   initlock(&netlock, "netlock");
+  initlock(&portlock, "portlock");
+  memset(port_bindings, 0, sizeof(port_bindings));
+  for(int i = 0; i < MAX_PORTS; i++) {//初始化做相应的修改
+    udp_queues[i].head = 0;
+    udp_queues[i].tail = 0;
+    udp_queues[i].count = 0;
+  }
 }
 
 
@@ -38,7 +52,18 @@ sys_bind(void)
   // Your code here.
   //
 
-  return -1;
+  int port;
+  argint(0, &port);
+  if(port < 0 || port > MAX_PORTS-1)
+    return -1;
+  acquire(&portlock);
+  if(port_bindings[port] != 0){
+    release(&portlock);
+    return -1;
+  }
+  port_bindings[port] = myproc()->pid;
+  release(&portlock);
+  return 0;
 }
 
 //
@@ -52,7 +77,18 @@ sys_unbind(void)
   //
   // Optional: Your code here.
   //
-
+  
+  int port;
+  argint(0, &port);
+  if(port < 0 || port > MAX_PORTS-1)
+    return -1;
+  acquire(&portlock);
+  if(port_bindings[port] == 0){
+    release(&portlock);
+    return -1;
+  }
+  port_bindings[port] = 0;
+  release(&portlock);
   return 0;
 }
 
@@ -71,13 +107,49 @@ sys_unbind(void)
 // dport, *src, and *sport are host byte order.
 // bind(dport) must previously have been called.
 //
+
 uint64
 sys_recv(void)
 {
   //
   // Your code here.
   //
-  return -1;
+  
+  int dport;
+  uint64 srcaddr,sportaddr,bufaddr;
+  int maxlen;
+
+  argint(0, &dport);
+  argaddr(1, &srcaddr);
+  argaddr(2, &sportaddr);
+  argaddr(3, &bufaddr);
+  argint(4, &maxlen);
+  acquire(&portlock);
+  if (port_bindings[dport] == 0) {
+    release(&portlock);
+    return -1;  // 端口未绑定，返回错误
+  }
+  struct udp_queue *queue = &udp_queues[dport];
+  while (queue->count == 0)
+    sleep(queue, &portlock);
+  struct udp_packet *packet = queue->packets[queue->head];
+  if (copyout(myproc()->pagetable, srcaddr, (char *)&packet->sip, sizeof(packet->sip)) < 0 ||
+      copyout(myproc()->pagetable, sportaddr, (char *)&packet->sport, sizeof(packet->sport)) < 0) {
+    release(&portlock);
+    return -1;  // 复制数据失败
+  }
+
+  int copylen = packet->len < maxlen ? packet->len : maxlen;
+  if (copyout(myproc()->pagetable, bufaddr, packet->payload, copylen) < 0) {
+    release(&portlock);
+    return -1;  // 复制数据失败
+  }
+  queue->head = (queue->head + 1) % UDP_QUEUE_LIMIT;
+  queue->count--;
+  kfree(packet);
+  release(&portlock);
+
+  return copylen;
 }
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
@@ -192,6 +264,47 @@ ip_rx(char *buf, int len)
   // Your code here.
   //
   
+  struct eth *eth = (struct eth *)buf;
+  // 解析 IP 头
+  struct ip *ip = (struct ip *)(eth + 1);
+  if(ip->ip_p != IPPROTO_UDP){//不是UDP包
+    kfree(buf);
+    return;
+  }
+  struct udp *udp = (struct udp *)(ip + 1);
+  int dport = ntohs(udp->dport);
+  int sport = ntohs(udp->sport);
+  int ulen = ntohs(udp->ulen)-sizeof(struct udp);//UDP有效载荷长度
+  acquire(&portlock);
+  if(port_bindings[dport] == 0){//没有绑定端口
+    release(&portlock);
+    // printf("ip_rx: port %d not bound\n", dport);
+    kfree(buf);
+    return;
+  }
+
+  struct udp_queue *queue = &udp_queues[dport];
+  if(queue->count>=UDP_QUEUE_LIMIT){//队列满
+    release(&portlock);
+    kfree(buf);
+    return;
+  }
+  struct udp_packet *packet;
+  if((packet = kalloc()) == 0){
+    release(&portlock);
+    kfree(buf);
+    return;
+  }
+  packet->sip = ntohl(ip->ip_src);
+  packet->sport = sport;
+  packet->len = ulen;
+  memmove(packet->payload, (char *)udp+sizeof(struct udp) , ulen);
+  queue->packets[queue->tail] = packet;
+  queue->tail = (queue->tail + 1) % UDP_QUEUE_LIMIT;
+  queue->count++;
+  release(&portlock);
+  kfree(buf);
+  wakeup(queue);
 }
 
 //

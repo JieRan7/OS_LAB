@@ -2,6 +2,10 @@
 // endianness support
 //
 
+// add
+#include "param.h"
+
+
 static inline uint16 bswaps(uint16 val)
 {
   return (((val & 0x00ffU) << 8) |
@@ -125,3 +129,23 @@ struct dns_data {
   uint32 ttl;
   uint16 len;
 } __attribute__((packed));
+
+
+#define UDP_QUEUE_LIMIT 16  
+#define MAX_PORTS 65536 
+
+// UDP 包的结构
+struct udp_packet {
+  uint16 sport;                 // 源端口千万要注意，如果是普通的int，会在copyout的时候越界从而影响sip的数值
+  uint32 sip;                   // 源 IP          这里大小一定要规范
+  int len;                   // 数据长度
+  char payload[FSSIZE-sizeof(struct eth)-sizeof(struct ip)-sizeof(struct udp)];  // UDP 有效负载
+};
+
+// UDP 队列的结构
+struct udp_queue {
+  struct udp_packet *packets[UDP_QUEUE_LIMIT];  // 保存 UDP 包的指针
+  int head;       // 队列头
+  int tail;       // 队列尾
+  int count;      // 队列中的包数
+};
